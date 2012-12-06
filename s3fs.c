@@ -1,3 +1,7 @@
+                                                                     
+                                                                     
+                                                                     
+                                             
 /* This code is based on the fine code written by Joseph Pfeiffer for his
    fuse system tutorial. */
 
@@ -50,52 +54,58 @@ int fs_getattr(const char *path, struct stat *statbuf) {
     char *dirpath = dirname(str1);
     char *end = basename(str2);
 
-
+    //use this to debug in case getattr is ever broken again
     fprintf(stderr, "end is :%s:\n", end);
     fprintf(stderr, "beginning is %s\n", dirpath);
 
-    //get information for root
+    //get preliminary dir path- this will either get us to the directory we need
+    //if we have a non-blank basename, we will then get the file/dirpath we want
     uint8_t *enddir = NULL;
     int rv = s3fs_get_object(ctx->s3bucket, dirpath, &enddir, 0, 0);
 
-    s3dirent_t *root = enddir;
+    s3dirent_t *dir = enddir;
 
-    //get number of entries in root
+    //get number of entries in dir
     int numEntries = (int) rv / sizeof(s3dirent_t);
+    fprintf(stderr, "number entries is %i\n",numEntries);
 
-    //no basename, we want the . entry
-    if(!strcasecmp(end, "") || !strcasecmp(end, "/")){
-        fprintf(stderr, "Returning root data\n");
-        *statbuf = root[0].metadata;
+    //no basename, we want the . entry. go home basename, you're drunk.
+    //@TODO: it is all too possible that the error comes from here. I'm unsure what the best way to check if a string is empty is.
+    if(end[0] == '\0' || !strcasecmp(end, "/")){
+        *statbuf = dir[0].metadata;
+        fprintf(stderr, "root metadata succesfully returned\n");
         free(str1);
         free(str2);
         return 0;
     }
 
     //get the dirpath of the thing we're looking for-
-    //if the basename is empty, get root metadata
+    //if the basename is empty, get dir metadata
     //otherwise iterate through and find proper file metadata
 
     int i = 0;
     for (;i<numEntries;i++){
-      if(!strcasecmp(end,root[i].name)){
-        if(root[i].type == 'f'){
+        fprintf(stderr, "%i:%s::%s\n",i,end,dir[i].name);
+      if(!strcasecmp(end,dir[i].name)){
+        if(dir[i].type == 'f'){
             fprintf(stderr, "it's a file.\n");
             //it's a file. return its metadata
-            *statbuf = root[i].metadata;
+            *statbuf = dir[i].metadata;
+            fprintf(stderr, "file metadata succesfully returned\n");
             free(str1);
             free(str2);
             return 0;
-        } else if(root[i].type == 'd'){
+        } else if(dir[i].type == 'd'){
             //get that directory and return its . entry
             fprintf(stderr, "it's a directory.\n");
-            s3dirent_t *retrieved_object = NULL;
+           s3dirent_t *retrieved_object = NULL;
             char buf[256];
-            snprintf(buf, sizeof(buf), "/%s", end);
+            snprintf(buf, sizeof(buf), "%s", path);
             fprintf(stderr, "getting object %s\n", &buf);
-            // zeroes as last two args means that we want to retrieve entire object
+            // download ALL THE OBJECTS!
             int rv2 = s3fs_get_object(ctx->s3bucket, &buf, &retrieved_object, 0, 0);
             *statbuf = retrieved_object[0].metadata;
+            fprintf(stderr, "directory metadata succesfully returned\n");
             free(str1);
             free(str2);
             return 0;
@@ -135,28 +145,29 @@ int fs_mkdir(const char *path, mode_t mode) {
     mode |= S_IFDIR;
 
     //Get the directory (just root for now).
-    s3dirent_t *root = NULL;
+    s3dirent_t *parent = NULL;
     char *str1 = strdup(path);
+    char *str2 = strdup(path);
     char *target = basename(str1);
-    ssize_t size = s3fs_get_object(ctx->s3bucket, "/", &root, 0, sizeof(s3dirent_t));
+    char *parentpath = dirname(str2);
+    fprintf(stderr, ":%s:\n",target);
+    ssize_t size = s3fs_get_object(ctx->s3bucket, parentpath, &parent, 0, sizeof(s3dirent_t));
     int numEntries = (int) size / sizeof(s3dirent_t);
     int i = 0;
     //Check whether the target directory exists.
     for (;i<numEntries;i++){
-      if(!strcasecmp(target,root[i].name)){
+      if(!strcasecmp(target,parent[i].name)){
         return -EEXIST;
       }
     }
     //Doesn't exist, so make it.
-    fprintf(stderr, "1\n");
-
     s3dirent_t *newEntry = malloc(sizeof(s3dirent_t));
     strcpy(newEntry->name, ".");
     fprintf(stderr, "2\n");
     newEntry->type = 'd';
     struct stat md;
     //blkcnt_t  st_blocks;
-    md.st_mode = (mode_t) S_IFDIR;
+    md.st_mode = (S_IFDIR | S_IRUSR | S_IWUSR | S_IXUSR);
     md.st_size = (off_t) sizeof(s3dirent_t);
     time_t now = time(NULL) - 18000;
     md.st_mtime = now;
@@ -167,22 +178,26 @@ int fs_mkdir(const char *path, mode_t mode) {
     md.st_gid = getgid();
     newEntry->metadata = md;
     fprintf(stderr, "3\n");
-    //New entry and metadata set up, modify parent directory's metadata.
-    root[0].metadata.st_size = (off_t) (numEntries+1)*sizeof(s3dirent_t);
-    root[0].metadata.st_mtime = now;
-    root[0].metadata.st_atime = now;
+
     //Reallocate the s3 directory object and add the new entry's information.
-    root = realloc(root, (numEntries+1)*sizeof(s3dirent_t));
-    strcpy(root[numEntries].name, target);
-    root[numEntries].type = 'd';
+    parent = realloc(parent, (numEntries+1)*sizeof(s3dirent_t));
+
+    //New entry and metadata set up, modify parent directory's metadata.
+    parent[0].metadata.st_size = (off_t) (numEntries+1)*sizeof(s3dirent_t);
+    parent[0].metadata.st_mtime = now;
+    parent[0].metadata.st_atime = now;
     fprintf(stderr, "4\n");
+
+    strcpy(parent[numEntries].name, target);
+    parent[numEntries].type = 'd';
+    
+    fprintf(stderr, "5\n");
     //Remove the old directory object, push the new one, then push the created object.
-    s3fs_remove_object(ctx->s3bucket,"/");
-    s3fs_put_object(ctx->s3bucket, "/", (uint8_t*)root, ((numEntries+1)*sizeof(s3dirent_t)));
+    s3fs_remove_object(ctx->s3bucket,parentpath);
+    s3fs_put_object(ctx->s3bucket, parentpath, (uint8_t*)parent, ((numEntries+1)*sizeof(s3dirent_t)));
     s3fs_put_object(ctx->s3bucket,path,(uint8_t*)newEntry,sizeof(s3dirent_t));
     return 0;
 }
-
 /*
  * Remove a file.
  */
@@ -209,7 +224,6 @@ int fs_rename(const char *path, const char *newpath) {
     //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
-
 /*
  * Change the permission bits of a file.
  */
@@ -236,7 +250,6 @@ int fs_truncate(const char *path, off_t newsize) {
     //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
-
 /*
  * Change the access and/or modification times of a file. 
  */
@@ -265,7 +278,6 @@ int fs_open(const char *path, struct fuse_file_info *fi) {
     return -EIO;
 }
 
-
 /* 
  * Read data from an open file
  *
@@ -275,7 +287,7 @@ int fs_open(const char *path, struct fuse_file_info *fi) {
  */
 int fs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_read(path=\"%s\", buf=%p, size=%d, offset=%d)\n",
-	        path, buf, (int)size, (int)offset);
+          path, buf, (int)size, (int)offset);
     //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
@@ -288,11 +300,10 @@ int fs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_
  */
 int fs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_write(path=\"%s\", buf=%p, size=%d, offset=%d)\n",
-	        path, buf, (int)size, (int)offset);
+          path, buf, (int)size, (int)offset);
     //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
-
 
 /* 
  * Possibly flush cached data for one file.
@@ -327,7 +338,6 @@ int fs_release(const char *path, struct fuse_file_info *fi) {
     //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
-
 /*
  * Synchronize file contents; any cached data should be written back to 
  * stable storage.
@@ -370,21 +380,46 @@ int fs_opendir(const char *path, struct fuse_file_info *fi) {
  * function for filling in directory items.
  */
 int fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset,
-	       struct fuse_file_info *fi)
+         struct fuse_file_info *fi)
 {
     fprintf(stderr, "fs_readdir(path=\"%s\", buf=%p, offset=%d)\n",
-	        path, buf, (int)offset);
-    //s3context_t *ctx = GET_PRIVATE_DATA;
+          path, buf, (int)offset);
+    s3context_t *ctx = GET_PRIVATE_DATA;
+
+    uint8_t *retrieved_object = NULL;
+    int rv = s3fs_get_object(ctx->s3bucket, path, &retrieved_object, 0, 0);
+    s3dirent_t *dir = (s3dirent_t *) retrieved_object;
+    if (rv < 0) {
+        printf("Failure in s3fs_get_object\n");
+        return -ENOENT;
+    } else if (rv < sizeof(s3dirent_t)) {
+        printf("Failed to retrieve entire object (s3fs_get_object %d)\n", rv);
+        return -EIO;
+    } else {
+        printf("Successfully retrieved test object from s3 (s3fs_get_object)\n");
+        int numEntries = (int) rv / sizeof(s3dirent_t);
+        fprintf(stderr, "There are currently %i entries.\n", numEntries);
+        int i = 0;
+
+        for (; i < numEntries; i++) {
+            // call filler function to fill in directory name
+            // to the supplied buffer
+            if (filler(buf, dir[i].name, NULL, 0) != 0) {
+                return -ENOMEM;
+            }
+        }
+        return 0;
+    }
+
     return -EIO;
 }
-
 /*
  * Release directory.
  */
 int fs_releasedir(const char *path, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_releasedir(path=\"%s\")\n", path);
-    //s3context_t *ctx = GET_PRIVATE_DATA;
-    return -EIO;
+    s3context_t *ctx = GET_PRIVATE_DATA;
+    return 0;
 }
 
 /*
@@ -396,7 +431,6 @@ int fs_fsyncdir(const char *path, int datasync, struct fuse_file_info *fi) {
     //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
-
 /*
  * Initialize the file system.  This is called once upon
  * file system startup.
@@ -405,13 +439,13 @@ void *fs_init(struct fuse_conn_info *conn)
 {
     fprintf(stderr, "fs_init --- initializing file system.\n");
     s3context_t *ctx = GET_PRIVATE_DATA;
-		fprintf(stderr, "%s\n",ctx->s3bucket);
-		//clear bucket
-		s3fs_clear_bucket(ctx->s3bucket);
-		//create directory object for root
-		s3dirent_t *root = malloc(sizeof(s3dirent_t));
+    fprintf(stderr, "%s\n",ctx->s3bucket);
+    //clear bucket
+    s3fs_clear_bucket(ctx->s3bucket);
+    //create directory object for root
+    s3dirent_t *root = malloc(sizeof(s3dirent_t));
     strcpy(root->name, ".");
-		root->type = 'd';
+    root->type = 'd';
     struct stat md;
     //blkcnt_t  st_blocks;
     md.st_mode = (S_IFDIR | S_IRUSR | S_IWUSR | S_IXUSR);
@@ -424,7 +458,7 @@ void *fs_init(struct fuse_conn_info *conn)
     md.st_uid = getuid();
     md.st_gid = getgid();
     root->metadata = md;
-		//store directory object to S3
+    //store directory object to S3
     fprintf(stderr, "got to bucket\n");//
     if(sizeof(s3dirent_t) == s3fs_put_object(ctx->s3bucket, (char*)"/", (uint8_t*)root, sizeof(s3dirent_t))){
       fprintf(stderr, "fs_init --- file sysetem initalized.\n");
@@ -464,7 +498,6 @@ int fs_ftruncate(const char *path, off_t offset, struct fuse_file_info *fi) {
     //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
-
 /*
  * The struct that contains pointers to all our callback
  * functions.  Those that are currently NULL aren't 
@@ -519,8 +552,8 @@ struct fuse_operations s3fs_ops = {
 int main(int argc, char *argv[]) {
     // don't allow anything to continue if we're running as root.  bad stuff.
     if ((getuid() == 0) || (geteuid() == 0)) {
-    	fprintf(stderr, "Don't run this as root.\n");
-    	return -1;
+      fprintf(stderr, "Don't run this as root.\n");
+      return -1;
     }
     s3context_t *stateinfo = malloc(sizeof(s3context_t));
     memset(stateinfo, 0, sizeof(s3context_t));
@@ -544,10 +577,9 @@ int main(int argc, char *argv[]) {
 
     fprintf(stderr, "Totally clearing s3 bucket\n");
     s3fs_clear_bucket(s3bucket);
-
     fprintf(stderr, "Starting up FUSE file system.\n");
     int fuse_stat = fuse_main(argc, argv, &s3fs_ops, stateinfo);
     fprintf(stderr, "Startup function (fuse_main) returned %d\n", fuse_stat);
-    
+
     return fuse_stat;
 }
