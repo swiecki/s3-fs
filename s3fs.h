@@ -27,7 +27,11 @@ typedef struct {
  * type) should go here.
  */
 
-
+typedef struct {
+	unsigned char type;
+	char name[256];
+	struct stat metadata;
+} s3dirent_t;
 
 
 #endif // __USERSPACEFS_H__

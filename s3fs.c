@@ -17,6 +17,8 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/xattr.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define GET_PRIVATE_DATA ((s3context_t *) fuse_get_context()->private_data)
 
@@ -39,9 +41,70 @@
  */
 
 int fs_getattr(const char *path, struct stat *statbuf) {
+    //@TODO: Need to free buffers after get_object
     fprintf(stderr, "fs_getattr(path=\"%s\")\n", path);
     s3context_t *ctx = GET_PRIVATE_DATA;
-    return -EIO;
+
+    char *str1 = strdup(path);
+    char *str2 = strdup(path);
+    char *dirpath = dirname(str1);
+    char *end = basename(str2);
+
+
+    fprintf(stderr, "end is :%s:\n", end);
+    fprintf(stderr, "beginning is %s\n", dirpath);
+
+    //get information for root
+    uint8_t *enddir = NULL;
+    int rv = s3fs_get_object(ctx->s3bucket, dirpath, &enddir, 0, 0);
+
+    s3dirent_t *root = enddir;
+
+    //get number of entries in root
+    int numEntries = (int) rv / sizeof(s3dirent_t);
+
+    //no basename, we want the . entry
+    if(!strcasecmp(end, "") || !strcasecmp(end, "/")){
+        fprintf(stderr, "Returning root data\n");
+        *statbuf = root[0].metadata;
+        free(str1);
+        free(str2);
+        return 0;
+    }
+
+    //get the dirpath of the thing we're looking for-
+    //if the basename is empty, get root metadata
+    //otherwise iterate through and find proper file metadata
+
+    int i = 0;
+    for (;i<numEntries;i++){
+      if(!strcasecmp(end,root[i].name)){
+        if(root[i].type == 'f'){
+            fprintf(stderr, "it's a file.\n");
+            //it's a file. return its metadata
+            *statbuf = root[i].metadata;
+            free(str1);
+            free(str2);
+            return 0;
+        } else if(root[i].type == 'd'){
+            //get that directory and return its . entry
+            fprintf(stderr, "it's a directory.\n");
+            s3dirent_t *retrieved_object = NULL;
+            char buf[256];
+            snprintf(buf, sizeof(buf), "/%s", end);
+            fprintf(stderr, "getting object %s\n", &buf);
+            // zeroes as last two args means that we want to retrieve entire object
+            int rv2 = s3fs_get_object(ctx->s3bucket, &buf, &retrieved_object, 0, 0);
+            *statbuf = retrieved_object[0].metadata;
+            free(str1);
+            free(str2);
+            return 0;
+        }
+      }
+    }
+    free(str1);
+    free(str2);
+    return -ENOENT;
 }
 
 
@@ -71,7 +134,53 @@ int fs_mkdir(const char *path, mode_t mode) {
     s3context_t *ctx = GET_PRIVATE_DATA;
     mode |= S_IFDIR;
 
-    return -EIO;
+    //Get the directory (just root for now).
+    s3dirent_t *root = NULL;
+    char *str1 = strdup(path);
+    char *target = basename(str1);
+    ssize_t size = s3fs_get_object(ctx->s3bucket, "/", &root, 0, sizeof(s3dirent_t));
+    int numEntries = (int) size / sizeof(s3dirent_t);
+    int i = 0;
+    //Check whether the target directory exists.
+    for (;i<numEntries;i++){
+      if(!strcasecmp(target,root[i].name)){
+        return -EEXIST;
+      }
+    }
+    //Doesn't exist, so make it.
+    fprintf(stderr, "1\n");
+
+    s3dirent_t *newEntry = malloc(sizeof(s3dirent_t));
+    strcpy(newEntry->name, ".");
+    fprintf(stderr, "2\n");
+    newEntry->type = 'd';
+    struct stat md;
+    //blkcnt_t  st_blocks;
+    md.st_mode = (mode_t) S_IFDIR;
+    md.st_size = (off_t) sizeof(s3dirent_t);
+    time_t now = time(NULL) - 18000;
+    md.st_mtime = now;
+    md.st_atime = now;
+    md.st_ctime = now;
+    md.st_nlink = (nlink_t) 1;
+    md.st_uid = getuid();
+    md.st_gid = getgid();
+    newEntry->metadata = md;
+    fprintf(stderr, "3\n");
+    //New entry and metadata set up, modify parent directory's metadata.
+    root[0].metadata.st_size = (off_t) (numEntries+1)*sizeof(s3dirent_t);
+    root[0].metadata.st_mtime = now;
+    root[0].metadata.st_atime = now;
+    //Reallocate the s3 directory object and add the new entry's information.
+    root = realloc(root, (numEntries+1)*sizeof(s3dirent_t));
+    strcpy(root[numEntries].name, target);
+    root[numEntries].type = 'd';
+    fprintf(stderr, "4\n");
+    //Remove the old directory object, push the new one, then push the created object.
+    s3fs_remove_object(ctx->s3bucket,"/");
+    s3fs_put_object(ctx->s3bucket, "/", (uint8_t*)root, ((numEntries+1)*sizeof(s3dirent_t)));
+    s3fs_put_object(ctx->s3bucket,path,(uint8_t*)newEntry,sizeof(s3dirent_t));
+    return 0;
 }
 
 /*
@@ -79,7 +188,7 @@ int fs_mkdir(const char *path, mode_t mode) {
  */
 int fs_unlink(const char *path) {
     fprintf(stderr, "fs_unlink(path=\"%s\")\n", path);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
 
@@ -88,7 +197,7 @@ int fs_unlink(const char *path) {
  */
 int fs_rmdir(const char *path) {
     fprintf(stderr, "fs_rmdir(path=\"%s\")\n", path);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
 
@@ -97,7 +206,7 @@ int fs_rmdir(const char *path) {
  */
 int fs_rename(const char *path, const char *newpath) {
     fprintf(stderr, "fs_rename(fpath=\"%s\", newpath=\"%s\")\n", path, newpath);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
 
@@ -106,7 +215,7 @@ int fs_rename(const char *path, const char *newpath) {
  */
 int fs_chmod(const char *path, mode_t mode) {
     fprintf(stderr, "fs_chmod(fpath=\"%s\", mode=0%03o)\n", path, mode);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
 
@@ -115,7 +224,7 @@ int fs_chmod(const char *path, mode_t mode) {
  */
 int fs_chown(const char *path, uid_t uid, gid_t gid) {
     fprintf(stderr, "fs_chown(path=\"%s\", uid=%d, gid=%d)\n", path, uid, gid);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
 
@@ -124,7 +233,7 @@ int fs_chown(const char *path, uid_t uid, gid_t gid) {
  */
 int fs_truncate(const char *path, off_t newsize) {
     fprintf(stderr, "fs_truncate(path=\"%s\", newsize=%d)\n", path, (int)newsize);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
 
@@ -133,7 +242,7 @@ int fs_truncate(const char *path, off_t newsize) {
  */
 int fs_utime(const char *path, struct utimbuf *ubuf) {
     fprintf(stderr, "fs_utime(path=\"%s\")\n", path);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
 
@@ -152,7 +261,7 @@ int fs_utime(const char *path, struct utimbuf *ubuf) {
  */
 int fs_open(const char *path, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_open(path\"%s\")\n", path);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
 
@@ -167,7 +276,7 @@ int fs_open(const char *path, struct fuse_file_info *fi) {
 int fs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_read(path=\"%s\", buf=%p, size=%d, offset=%d)\n",
 	        path, buf, (int)size, (int)offset);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
 
@@ -180,7 +289,7 @@ int fs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_
 int fs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_write(path=\"%s\", buf=%p, size=%d, offset=%d)\n",
 	        path, buf, (int)size, (int)offset);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
 
@@ -196,7 +305,7 @@ int fs_write(const char *path, const char *buf, size_t size, off_t offset, struc
  */
 int fs_flush(const char *path, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_flush(path=\"%s\", fi=%p)\n", path, fi);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
 
@@ -215,7 +324,7 @@ int fs_flush(const char *path, struct fuse_file_info *fi) {
  */
 int fs_release(const char *path, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_release(path=\"%s\")\n", path);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
 
@@ -237,7 +346,23 @@ int fs_fsync(const char *path, int datasync, struct fuse_file_info *fi) {
 int fs_opendir(const char *path, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_opendir(path=\"%s\")\n", path);
     s3context_t *ctx = GET_PRIVATE_DATA;
-    return -EIO;
+
+    uint8_t *retrieved_object = NULL;
+    int rv = s3fs_get_object(ctx->s3bucket, path, &retrieved_object, 0, 0);
+
+    if (rv < 0) {
+        printf("Failure in s3fs_get_object\n");
+        return -ENOENT;
+    } else if (rv < sizeof(s3dirent_t)) {
+        printf("Failed to retrieve entire object (s3fs_get_object %d)\n", rv);
+        return -EIO;
+    } else {
+        printf("Successfully retrieved test object from s3 (s3fs_get_object)\n");
+        int numEntries = (int) rv / sizeof(s3dirent_t);
+        fprintf(stderr, "There are currently %i entries.\n", numEntries);
+        int i = 0;
+        return 0;
+    }
 }
 
 /*
@@ -249,7 +374,7 @@ int fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset
 {
     fprintf(stderr, "fs_readdir(path=\"%s\", buf=%p, offset=%d)\n",
 	        path, buf, (int)offset);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
 
@@ -258,7 +383,7 @@ int fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset
  */
 int fs_releasedir(const char *path, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_releasedir(path=\"%s\")\n", path);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
 
@@ -268,7 +393,7 @@ int fs_releasedir(const char *path, struct fuse_file_info *fi) {
  */
 int fs_fsyncdir(const char *path, int datasync, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_fsyncdir(path=\"%s\")\n", path);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
 
@@ -280,6 +405,33 @@ void *fs_init(struct fuse_conn_info *conn)
 {
     fprintf(stderr, "fs_init --- initializing file system.\n");
     s3context_t *ctx = GET_PRIVATE_DATA;
+		fprintf(stderr, "%s\n",ctx->s3bucket);
+		//clear bucket
+		s3fs_clear_bucket(ctx->s3bucket);
+		//create directory object for root
+		s3dirent_t *root = malloc(sizeof(s3dirent_t));
+    strcpy(root->name, ".");
+		root->type = 'd';
+    struct stat md;
+    //blkcnt_t  st_blocks;
+    md.st_mode = (S_IFDIR | S_IRUSR | S_IWUSR | S_IXUSR);
+    md.st_size = (off_t) sizeof(s3dirent_t);
+    time_t now = time(NULL) - 18000;
+    md.st_mtime = now;
+    md.st_atime = now;
+    md.st_ctime = now;
+    md.st_nlink = (nlink_t) 1;
+    md.st_uid = getuid();
+    md.st_gid = getgid();
+    root->metadata = md;
+		//store directory object to S3
+    fprintf(stderr, "got to bucket\n");//
+    if(sizeof(s3dirent_t) == s3fs_put_object(ctx->s3bucket, (char*)"/", (uint8_t*)root, sizeof(s3dirent_t))){
+      fprintf(stderr, "fs_init --- file sysetem initalized.\n");
+      free(root);
+    }else{
+      printf("\n"); return NULL;
+    }
     return ctx;
 }
 
@@ -298,7 +450,7 @@ void fs_destroy(void *userdata) {
  */
 int fs_access(const char *path, int mask) {
     fprintf(stderr, "fs_access(path=\"%s\", mask=0%o)\n", path, mask);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return 0;
 }
 
@@ -309,7 +461,7 @@ int fs_access(const char *path, int mask) {
  */
 int fs_ftruncate(const char *path, off_t offset, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_ftruncate(path=\"%s\", offset=%d)\n", path, (int)offset);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
 
