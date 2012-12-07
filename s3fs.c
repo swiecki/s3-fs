@@ -172,7 +172,7 @@ int fs_mknod(const char *path, mode_t mode, dev_t dev) {
 	//Wipe the old parent, then push the parent directory and new file up.
     s3fs_remove_object(ctx->s3bucket,parentPath);
     s3fs_put_object(ctx->s3bucket,parentPath,(uint8_t*)parent,(sizeof(s3dirent_t)*(numEntries+1)));
-    s3fs_put_object(ctx->s3bucket,childName,(uint8_t*)parent,0);
+    s3fs_put_object(ctx->s3bucket,path,(uint8_t*)parent,0);
 
     return 0;
 }
@@ -465,7 +465,7 @@ int fs_flush(const char *path, struct fuse_file_info *fi) {
  */
 int fs_release(const char *path, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_release(path=\"%s\")\n", path);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return 0;
 }
 /*
