@@ -209,7 +209,6 @@ int fs_mkdir(const char *path, mode_t mode) {
     //Doesn't exist, so make it.
     s3dirent_t *newEntry = malloc(sizeof(s3dirent_t));
     strcpy(newEntry->name, ".");
-    fprintf(stderr, "2\n");
     newEntry->type = 'd';
     struct stat md;
     md.st_blocks = (blkcnt_t) 0;
@@ -223,7 +222,6 @@ int fs_mkdir(const char *path, mode_t mode) {
     md.st_uid = getuid();
     md.st_gid = getgid();
     newEntry->metadata = md;
-    fprintf(stderr, "3\n");
 		
     //Reallocate the s3 directory object and add the new entry's information.
     parent = realloc(parent, (numEntries+1)*sizeof(s3dirent_t));
@@ -232,12 +230,11 @@ int fs_mkdir(const char *path, mode_t mode) {
     parent[0].metadata.st_size = (off_t) (numEntries+1)*sizeof(s3dirent_t);
     parent[0].metadata.st_mtime = now;
     parent[0].metadata.st_atime = now;
-    fprintf(stderr, "4\n");
 
     strcpy(parent[numEntries].name, target);
     parent[numEntries].type = 'd';
     printf("Number of entries: %i",numEntries);
-    fprintf(stderr, "5\n");
+    
     //Remove the old directory object, push the new one, then push the created object.
     s3fs_remove_object(ctx->s3bucket,parentpath);
     s3fs_put_object(ctx->s3bucket, parentpath, (uint8_t*)parent, ((numEntries+1)*sizeof(s3dirent_t)));
@@ -257,6 +254,7 @@ int fs_unlink(const char *path) {
  * Remove a directory. 
  */
 int fs_rmdir(const char *path) {
+    //TODO: add detection in case it is a file- return an error
     fprintf(stderr, "fs_rmdir(path=\"%s\")\n", path);
     s3context_t *ctx = GET_PRIVATE_DATA;
 
@@ -273,14 +271,16 @@ int fs_rmdir(const char *path) {
     }
     //Directory exists and is empty.
     //Get the parent directory.
-    char* base = strdup(path);
-    base = basename(base);//Or somesuch.
+    char *str1 = strdup(path);
+    char *str2 = strdup(path);
+
+    char* base = basename(str1);
+    char *parentName = dirname(str2);
+
     s3dirent_t *parent = NULL;
-    char *parentName = strdup(path);
-    parentName = dirname(parentName);//Or something that won't cause it to screw up.
     ssize_t parentSize = s3fs_get_object(ctx->s3bucket,parentName,(uint8_t **)&parent,0,0);
     //Modify the parent's metadata.
-    time_t now = time(NULL)-18000;//TODO: Fix the time hack.
+    time_t now = time(NULL)-18000;
     parent[0].metadata.st_mtime = now;
     parent[0].metadata.st_atime = now;
     parent[0].metadata.st_size -= (off_t) sizeof(s3dirent_t);
@@ -311,8 +311,45 @@ int fs_rmdir(const char *path) {
  */
 int fs_rename(const char *path, const char *newpath) {
     fprintf(stderr, "fs_rename(fpath=\"%s\", newpath=\"%s\")\n", path, newpath);
-    //s3context_t *ctx = GET_PRIVATE_DATA;
-    return -EIO;
+    s3context_t *ctx = GET_PRIVATE_DATA;
+    //pull down parent directory, change name of file there
+    char *str1 = strdup(path);
+    char *str2 = strdup(path);
+    char *str3 = strdup(newpath);
+
+    char *base = basename(str1);
+    char *parentName = dirname(str2);
+    char *newname = basename(str3);
+
+    s3dirent_t *parent = NULL;
+    ssize_t parentSize = s3fs_get_object(ctx->s3bucket,parentName,(uint8_t **)&parent,0,0);
+    if(parentSize < 0){
+        return -ENOENT;//Part of the directory does not exist.
+    }
+    fprintf(stderr, "1\n");
+    //Modify the parent's metadata.
+    time_t now = time(NULL)-18000;
+    parent[0].metadata.st_mtime = now;
+    parent[0].metadata.st_atime = now;
+    int numEntries = (int) parentSize/sizeof(s3dirent_t);
+    int i = 0;
+    for (;i<numEntries;i++){
+        if(!strcasecmp(parent[i].name,base)){
+            strcpy(parent[i].name, newname);
+        }
+    }
+    //pull down file, remove it from server, put it back under new name
+    uint8_t  *entry = NULL;
+    ssize_t fileSize = s3fs_get_object(ctx->s3bucket,path,(uint8_t**)&entry,0,0);
+    if(fileSize < 0){
+        return -ENOENT;//Part of the directory does not exist.
+    }
+    s3fs_remove_object(ctx->s3bucket,path);
+    s3fs_remove_object(ctx->s3bucket,parentName);
+    s3fs_put_object(ctx->s3bucket,newpath,(uint8_t*)entry,fileSize);
+    s3fs_put_object(ctx->s3bucket, parentName, (uint8_t*)parent, ((numEntries)*sizeof(s3dirent_t)));
+
+    return 0;
 }
 /*
  * Change the permission bits of a file.
@@ -320,6 +357,8 @@ int fs_rename(const char *path, const char *newpath) {
 int fs_chmod(const char *path, mode_t mode) {
     fprintf(stderr, "fs_chmod(fpath=\"%s\", mode=0%03o)\n", path, mode);
     //s3context_t *ctx = GET_PRIVATE_DATA;
+    //pull down parent directory, if path leads to a directory, change mode of . entry
+    //if path leads to file, change file mode metadata
     return -EIO;
 }
 
@@ -329,6 +368,8 @@ int fs_chmod(const char *path, mode_t mode) {
 int fs_chown(const char *path, uid_t uid, gid_t gid) {
     fprintf(stderr, "fs_chown(path=\"%s\", uid=%d, gid=%d)\n", path, uid, gid);
     //s3context_t *ctx = GET_PRIVATE_DATA;
+    //pull down parent directory, if path leads to a directory, change mode of . entry
+    //if path leads to file, change file mode metadata
     return -EIO;
 }
 
@@ -372,7 +413,7 @@ int fs_utime(const char *path, struct utimbuf *ubuf) {
 int fs_open(const char *path, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_open(path\"%s\")\n", path);
     s3context_t *ctx = GET_PRIVATE_DATA;
-		//Check whether the file exists.
+	//Check whether the file exists.
     s3dirent_t  *entry = NULL;
     char *str1 = strdup(path);
     char *str2 = strdup(path);
