@@ -63,14 +63,14 @@ int fs_getattr(const char *path, struct stat *statbuf) {
     uint8_t *enddir = NULL;
     int rv = s3fs_get_object(ctx->s3bucket, dirpath, &enddir, 0, 0);
 
-    s3dirent_t *dir = enddir;
+    s3dirent_t *dir = (s3dirent_t *) enddir;
 
     //get number of entries in dir
     int numEntries = (int) rv / sizeof(s3dirent_t);
     fprintf(stderr, "number entries is %i\n",numEntries);
 
     //no basename, we want the . entry. go home basename, you're drunk.
-    //@TODO: it is all too possible that the error comes from here. I'm unsure what the best way to check if a string is empty is.
+    //@TODO: it is all too possible that an error comes from here. I'm unsure what the best way to check if a string is empty is.
     if(end[0] == '\0' || !strcasecmp(end, "/")){
         *statbuf = dir[0].metadata;
         fprintf(stderr, "root metadata succesfully returned\n");
@@ -98,17 +98,25 @@ int fs_getattr(const char *path, struct stat *statbuf) {
         } else if(dir[i].type == 'd'){
             //get that directory and return its . entry
             fprintf(stderr, "it's a directory.\n");
-           s3dirent_t *retrieved_object = NULL;
+            s3dirent_t *retrieved_object = NULL;
             char buf[256];
             snprintf(buf, sizeof(buf), "%s", path);
-            fprintf(stderr, "getting object %s\n", &buf);
+            fprintf(stderr, "getting object %s\n", (char*)&buf);
             // download ALL THE OBJECTS!
-            int rv2 = s3fs_get_object(ctx->s3bucket, &buf, &retrieved_object, 0, 0);
-            *statbuf = retrieved_object[0].metadata;
-            fprintf(stderr, "directory metadata succesfully returned\n");
-            free(str1);
-            free(str2);
-            return 0;
+            // 
+            int rv2 = s3fs_get_object(ctx->s3bucket, (char *) &buf, (uint8_t **)&retrieved_object, 0, 0);
+            if (rv2 < 0) {
+                printf("Failure in s3fs_get_object\n");
+            } else if (rv2 < sizeof(s3dirent_t)) {
+                printf("Failed to retrieve entire object (s3fs_get_object %d)\n", rv);
+            } else {
+                printf("Successfully retrieved test object from s3 (s3fs_get_object)\n");
+                *statbuf = retrieved_object[0].metadata;
+                fprintf(stderr, "directory metadata succesfully returned\n");
+                free(str1);
+                free(str2);
+                return 0;
+            }
         }
       }
     }
@@ -127,7 +135,7 @@ int fs_getattr(const char *path, struct stat *statbuf) {
  */
 int fs_mknod(const char *path, mode_t mode, dev_t dev) {
     fprintf(stderr, "fs_mknod(path=\"%s\", mode=0%3o)\n", path, mode);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
 
@@ -151,7 +159,7 @@ int fs_mkdir(const char *path, mode_t mode) {
     char *target = basename(str1);
     char *parentpath = dirname(str2);
     fprintf(stderr, ":%s:\n",target);
-    ssize_t size = s3fs_get_object(ctx->s3bucket, parentpath, &parent, 0, sizeof(s3dirent_t));
+    ssize_t size = s3fs_get_object(ctx->s3bucket, parentpath,(uint8_t **) &parent, 0,0);
     int numEntries = (int) size / sizeof(s3dirent_t);
     int i = 0;
     //Check whether the target directory exists.
@@ -166,7 +174,7 @@ int fs_mkdir(const char *path, mode_t mode) {
     fprintf(stderr, "2\n");
     newEntry->type = 'd';
     struct stat md;
-    //blkcnt_t  st_blocks;
+    md.st_blocks = (blkcnt_t) 0;
     md.st_mode = (S_IFDIR | S_IRUSR | S_IWUSR | S_IXUSR);
     md.st_size = (off_t) sizeof(s3dirent_t);
     time_t now = time(NULL) - 18000;
@@ -178,10 +186,10 @@ int fs_mkdir(const char *path, mode_t mode) {
     md.st_gid = getgid();
     newEntry->metadata = md;
     fprintf(stderr, "3\n");
-
+		
     //Reallocate the s3 directory object and add the new entry's information.
     parent = realloc(parent, (numEntries+1)*sizeof(s3dirent_t));
-
+		
     //New entry and metadata set up, modify parent directory's metadata.
     parent[0].metadata.st_size = (off_t) (numEntries+1)*sizeof(s3dirent_t);
     parent[0].metadata.st_mtime = now;
@@ -190,7 +198,7 @@ int fs_mkdir(const char *path, mode_t mode) {
 
     strcpy(parent[numEntries].name, target);
     parent[numEntries].type = 'd';
-    
+    printf("Number of entries: %i",numEntries);
     fprintf(stderr, "5\n");
     //Remove the old directory object, push the new one, then push the created object.
     s3fs_remove_object(ctx->s3bucket,parentpath);
@@ -212,8 +220,52 @@ int fs_unlink(const char *path) {
  */
 int fs_rmdir(const char *path) {
     fprintf(stderr, "fs_rmdir(path=\"%s\")\n", path);
-    //s3context_t *ctx = GET_PRIVATE_DATA;
-    return -EIO;
+    s3context_t *ctx = GET_PRIVATE_DATA;
+
+    //Get the directory as a check
+    s3dirent_t *targetDir = NULL;
+    ssize_t dirSize = s3fs_get_object(ctx->s3bucket,path,(uint8_t **)&targetDir,0,0);
+    if(dirSize < 0){
+        //Directory doesn't exist.
+        return 0; //Well, it's not there anymore...
+    }
+    if(dirSize != sizeof(s3dirent_t)){
+        //Directory is too full to delete.
+        return -ENOTEMPTY;
+    }
+    //Directory exists and is empty.
+    //Get the parent directory.
+    char* base = strdup(path);
+    base = basename(base);//Or somesuch.
+    s3dirent_t *parent = NULL;
+    char *parentName = strdup(path);
+    parentName = dirname(parentName);//Or something that won't cause it to screw up.
+    ssize_t parentSize = s3fs_get_object(ctx->s3bucket,parentName,(uint8_t **)&parent,0,0);
+    //Modify the parent's metadata.
+    time_t now = time(NULL)-18000;//TODO: Fix the time hack.
+    parent[0].metadata.st_mtime = now;
+    parent[0].metadata.st_atime = now;
+    parent[0].metadata.st_size -= (off_t) sizeof(s3dirent_t);
+    int index = 0;
+    int entries = (int) parentSize/sizeof(s3dirent_t);
+    int i = 0;
+    for (;i<entries;i++){
+        if(!strcasecmp(parent[i].name,base)){
+            //This is where the directory is
+            index = i;
+        }
+    }
+    //Pull the last item out of the parent directory, reallocate, and juggle entries around.
+    s3dirent_t finalEntry = parent[entries-1];
+    parent = realloc(parent, (entries-1)*sizeof(s3dirent_t));
+    if(index<(entries-1)){
+        parent[index] = finalEntry;
+    }
+    //Erase the item from the s3 bucket and push the parent back up.
+    s3fs_remove_object(ctx->s3bucket,path);
+    s3fs_remove_object(ctx->s3bucket,parentName);
+    s3fs_put_object(ctx->s3bucket,parentName,(uint8_t*)parent,((entries-1)*sizeof(s3dirent_t)));
+    return 0;
 }
 
 /*
@@ -344,7 +396,7 @@ int fs_release(const char *path, struct fuse_file_info *fi) {
  */
 int fs_fsync(const char *path, int datasync, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_fsync(path=\"%s\")\n", path);
-
+    return 0;
 }
 
 /*
@@ -370,7 +422,6 @@ int fs_opendir(const char *path, struct fuse_file_info *fi) {
         printf("Successfully retrieved test object from s3 (s3fs_get_object)\n");
         int numEntries = (int) rv / sizeof(s3dirent_t);
         fprintf(stderr, "There are currently %i entries.\n", numEntries);
-        int i = 0;
         return 0;
     }
 }
@@ -418,7 +469,7 @@ int fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset
  */
 int fs_releasedir(const char *path, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_releasedir(path=\"%s\")\n", path);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return 0;
 }
 
@@ -447,7 +498,7 @@ void *fs_init(struct fuse_conn_info *conn)
     strcpy(root->name, ".");
     root->type = 'd';
     struct stat md;
-    //blkcnt_t  st_blocks;
+    md.st_blocks = (blkcnt_t) 0;
     md.st_mode = (S_IFDIR | S_IRUSR | S_IWUSR | S_IXUSR);
     md.st_size = (off_t) sizeof(s3dirent_t);
     time_t now = time(NULL) - 18000;
