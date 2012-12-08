@@ -44,7 +44,6 @@
  * do not need to be filled in).
  */
 
-    //TODO: Check for permissions.
 
 int fs_getattr(const char *path, struct stat *statbuf) {
     
