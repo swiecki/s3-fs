@@ -44,19 +44,18 @@
  * do not need to be filled in).
  */
 
+    //TODO: Check for permissions.
+
 int fs_getattr(const char *path, struct stat *statbuf) {
-    //@TODO: Need to free buffers after get_object
+    
     fprintf(stderr, "fs_getattr(path=\"%s\")\n", path);
     s3context_t *ctx = GET_PRIVATE_DATA;
 
     char *str1 = strdup(path);
     char *str2 = strdup(path);
+
     char *dirpath = dirname(str1);
     char *end = basename(str2);
-
-    //use this to debug in case getattr is ever broken again
-    fprintf(stderr, "end is :%s:\n", end);
-    fprintf(stderr, "beginning is %s\n", dirpath);
 
     //get preliminary dir path- this will either get us to the directory we need
     //if we have a non-blank basename, we will then get the file/dirpath we want
@@ -70,12 +69,12 @@ int fs_getattr(const char *path, struct stat *statbuf) {
     fprintf(stderr, "number entries is %i\n",numEntries);
 
     //no basename, we want the . entry. go home basename, you're drunk.
-    //@TODO: it is all too possible that an error comes from here. I'm unsure what the best way to check if a string is empty is.
     if(end[0] == '\0' || !strcasecmp(end, "/")){
         *statbuf = dir[0].metadata;
         fprintf(stderr, "root metadata succesfully returned\n");
         free(str1);
         free(str2);
+        free(enddir);
         return 0;
     }
 
@@ -88,12 +87,11 @@ int fs_getattr(const char *path, struct stat *statbuf) {
         fprintf(stderr, "%i:%s::%s\n",i,end,dir[i].name);
       if(!strcasecmp(end,dir[i].name)){
         if(dir[i].type == 'f'){
-            fprintf(stderr, "it's a file.\n");
             //it's a file. return its metadata
             *statbuf = dir[i].metadata;
-            fprintf(stderr, "file metadata succesfully returned\n");
             free(str1);
             free(str2);
+            free(enddir);
             return 0;
         } else if(dir[i].type == 'd'){
             //get that directory and return its . entry
@@ -112,9 +110,10 @@ int fs_getattr(const char *path, struct stat *statbuf) {
             } else {
                 printf("Successfully retrieved test object from s3 (s3fs_get_object)\n");
                 *statbuf = retrieved_object[0].metadata;
-                fprintf(stderr, "directory metadata succesfully returned\n");
                 free(str1);
                 free(str2);
+                free(enddir);
+                free(retrieved_object);
                 return 0;
             }
         }
@@ -122,6 +121,7 @@ int fs_getattr(const char *path, struct stat *statbuf) {
     }
     free(str1);
     free(str2);
+    free(enddir);
     return -ENOENT;
 }
 
@@ -139,15 +139,17 @@ int fs_mknod(const char *path, mode_t mode, dev_t dev) {
     
 	//Pull down the appropriate directory to check whether it exists.
     char *parentPath = strdup(path);
-    parentPath = dirname(parentPath);
     char *childName = strdup(path);
+    parentPath = dirname(parentPath);
     childName = basename(childName);
     s3dirent_t *parent = NULL;
     ssize_t parentSize = s3fs_get_object(ctx->s3bucket,parentPath,(uint8_t**)&parent,0,0);
     if(parentSize < 0){
+        free(parentPath);
+        free(childName);
+        free(parent);
 		return -ENOENT;//Part of the directory does not exist.
     }
-	//TODO: Check for permissions.
 	//Add an entry for the file in the directory and give it correct metadata.
     int numEntries = (int) parentSize / sizeof(s3dirent_t);
     parent = realloc(parent,(sizeof(s3dirent_t)*(numEntries+1)));
@@ -174,6 +176,9 @@ int fs_mknod(const char *path, mode_t mode, dev_t dev) {
     s3fs_put_object(ctx->s3bucket,parentPath,(uint8_t*)parent,(sizeof(s3dirent_t)*(numEntries+1)));
     s3fs_put_object(ctx->s3bucket,path,(uint8_t*)parent,0);
 
+    free(parentPath);
+    free(childName);
+    free(parent);
     return 0;
 }
 
@@ -194,6 +199,7 @@ int fs_mkdir(const char *path, mode_t mode) {
     s3dirent_t *parent = NULL;
     char *str1 = strdup(path);
     char *str2 = strdup(path);
+
     char *target = basename(str1);
     char *parentpath = dirname(str2);
     fprintf(stderr, ":%s:\n",target);
@@ -203,6 +209,9 @@ int fs_mkdir(const char *path, mode_t mode) {
     //Check whether the target directory exists.
     for (;i<numEntries;i++){
       if(!strcasecmp(target,parent[i].name)){
+        free(str1);
+        free(str2);
+        free(parent);
         return -EEXIST;
       }
     }
@@ -239,6 +248,10 @@ int fs_mkdir(const char *path, mode_t mode) {
     s3fs_remove_object(ctx->s3bucket,parentpath);
     s3fs_put_object(ctx->s3bucket, parentpath, (uint8_t*)parent, ((numEntries+1)*sizeof(s3dirent_t)));
     s3fs_put_object(ctx->s3bucket,path,(uint8_t*)newEntry,sizeof(s3dirent_t));
+    free(str1);
+    free(str2);
+    free(parent);
+    free(newEntry);
     return 0;
 }
 /*
@@ -252,14 +265,21 @@ int fs_unlink(const char *path) {
     s3dirent_t *parent = NULL;
     char *str1 = strdup(path);
     char *str2 = strdup(path);
+    
     char *childName = basename(str1);
     char *parentName = dirname(str2);
     ssize_t childSize = s3fs_get_object(ctx->s3bucket,path,(uint8_t**)&target,0,0);
     if(childSize < 0){
+        free(target);
+        free(str1);
+        free(str2);
         return -ENOENT;//file does not exist
     }
     //Make sure it isn't a directory.
     if(target[0].type == 'd'){
+        free(target);
+        free(str1);
+        free(str2);
         return -EISDIR;
     }
     //If it does, pull down the parent directory.
@@ -274,6 +294,10 @@ int fs_unlink(const char *path) {
         }
     }
     if(index<0){
+        free(target);
+        free(str1);
+        free(str2);
+        free(parent);
         return -ENOENT;//File doesn't exist in the directory; problem.
     }
     //Update the parent's metadata.
@@ -286,6 +310,10 @@ int fs_unlink(const char *path) {
     s3fs_put_object(ctx->s3bucket,parentName,(uint8_t*)parent,((numEntries-1)*sizeof(s3dirent_t)));
     //Erase the file from the bucket.
     s3fs_remove_object(ctx->s3bucket,path);
+    free(target);
+    free(str1);
+    free(str2);
+    free(parent);
     return 0;
 }
 
@@ -293,7 +321,6 @@ int fs_unlink(const char *path) {
  * Remove a directory. 
  */
 int fs_rmdir(const char *path) {
-    //TODO: add detection in case it is a file- return an error
     fprintf(stderr, "fs_rmdir(path=\"%s\")\n", path);
     s3context_t *ctx = GET_PRIVATE_DATA;
 
@@ -302,10 +329,12 @@ int fs_rmdir(const char *path) {
     ssize_t dirSize = s3fs_get_object(ctx->s3bucket,path,(uint8_t **)&targetDir,0,0);
     if(dirSize < 0){
         //Directory doesn't exist.
+        free(targetDir);
         return 0; //Well, it's not there anymore...
     }
     if(dirSize != sizeof(s3dirent_t)){
         //Directory is too full to delete.
+        free(targetDir);
         return -ENOTEMPTY;
     }
     //Directory exists and is empty.
@@ -342,6 +371,11 @@ int fs_rmdir(const char *path) {
     s3fs_remove_object(ctx->s3bucket,path);
     s3fs_remove_object(ctx->s3bucket,parentName);
     s3fs_put_object(ctx->s3bucket,parentName,(uint8_t*)parent,((entries-1)*sizeof(s3dirent_t)));
+
+    free(str1);
+    free(str2);
+    free(targetDir);
+    free(parent);
     return 0;
 }
 
@@ -363,6 +397,10 @@ int fs_rename(const char *path, const char *newpath) {
     s3dirent_t *parent = NULL;
     ssize_t parentSize = s3fs_get_object(ctx->s3bucket,parentName,(uint8_t **)&parent,0,0);
     if(parentSize < 0){
+        free(str1);
+        free(str2);
+        free(str3);
+        free(parent);
         return -ENOENT;//Part of the directory does not exist.
     }
     //Modify the parent's metadata.
@@ -379,6 +417,11 @@ int fs_rename(const char *path, const char *newpath) {
     uint8_t  *entry = NULL;
     ssize_t fileSize = s3fs_get_object(ctx->s3bucket,path,(uint8_t**)&entry,0,0);
     if(fileSize < 0){
+        free(str1);
+        free(str2);
+        free(str3);
+        free(parent);
+        free(entry);
         return -ENOENT;//Part of the directory does not exist.
     }
 
@@ -386,7 +429,11 @@ int fs_rename(const char *path, const char *newpath) {
     s3fs_remove_object(ctx->s3bucket,path);
     s3fs_remove_object(ctx->s3bucket,parentName);
     s3fs_put_object(ctx->s3bucket, parentName, (uint8_t*)parent, ((numEntries)*sizeof(s3dirent_t)));
-    
+    free(str1);
+    free(str2);
+    free(str3);
+    free(parent);
+    free(entry);
     return 0;
 }
 /*
@@ -426,6 +473,9 @@ int fs_truncate(const char *path, off_t newsize) {
     char *parentName = dirname(str2);
     ssize_t childSize = s3fs_get_object(ctx->s3bucket,path,(uint8_t**)&target,0,0);
     if(childSize < 0){
+        free(target);
+        free(str1);
+        free(str2);
         return -ENOENT;//file does not exist
     }
     //If it does, pull down the parent directory.
@@ -441,6 +491,10 @@ int fs_truncate(const char *path, off_t newsize) {
     }
     //Make sure it isn't a directory.
     if(parent[i].type == 'd'){
+        free(target);
+        free(str1);
+        free(str2);
+        free(parent);
         return -EISDIR;
     }
     time_t now = time(NULL) - 18000;
@@ -453,6 +507,10 @@ int fs_truncate(const char *path, off_t newsize) {
     //Replace old files with the modified directory and new (empty) file.
     s3fs_put_object(ctx->s3bucket,path,(uint8_t*)target,0);
     s3fs_put_object(ctx->s3bucket,parentName,(uint8_t*)parent,parentSize);
+    free(target);
+    free(str1);
+    free(str2);
+    free(parent);
     return 0;
 }
 /*
@@ -486,7 +544,6 @@ int fs_open(const char *path, struct fuse_file_info *fi) {
     char *str2 = strdup(path);
     char *dirpath = dirname(str1);
     char *end = basename(str2);
-    int found = 0;
     int size = s3fs_get_object(ctx->s3bucket,dirpath,(uint8_t**)&entry,0,0);
     int numEntries = (int) size / sizeof(s3dirent_t);
 
@@ -495,17 +552,17 @@ int fs_open(const char *path, struct fuse_file_info *fi) {
         fprintf(stderr, "%i:%s::%s\n",i,end,entry[i].name);
       if(!strcasecmp(end,entry[i].name)){
         if(entry[i].type == 'f'){
-            found = 1;
             free(str1);
             free(str2);
+            free(entry);
             return 0;
         } 
       }
     }
-    if(found==0){
-        return -ENOENT;
-    }
-    return 0;
+    free(str1);
+    free(str2);
+    free(entry);
+    return -ENOENT;
 }
 
 /* 
@@ -523,10 +580,12 @@ int fs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_
     uint8_t  *entry = NULL;
     int fileSize = s3fs_get_object(ctx->s3bucket,path,(uint8_t**)&entry,0,0);
     if(fileSize<0){
+        free(entry);
         return -ENOENT;
     }
     memset(buf,0,size);
     memcpy(buf,(void *)&entry[offset],fileSize);
+    free(entry);
     return fileSize;
 }
 
@@ -543,18 +602,24 @@ int fs_write(const char *path, const char *buf, size_t size, off_t offset, struc
 
     char *str1 = strdup(path);
     char *str2 = strdup(path);
+
     char *base = basename(str1);
     char *dir = dirname(str2);
 
-    int *olddata = NULL;
+    uint8_t *olddata = NULL;
     int rv = s3fs_get_object(ctx->s3bucket, path, (uint8_t **) &olddata, 0, offset);
     if(rv == -1){
+        free(str1);
+        free(str2);
+        free(olddata);
         return -EIO; //no file
-    }    int realsize = (rv - offset) + rv + size;
+    }    
+    int realsize = (rv - offset) + rv + size;
     olddata = realloc(olddata,realsize);
     memcpy((void *)&olddata[offset],(void *)buf,size);
     s3fs_remove_object(ctx->s3bucket, path);
     s3fs_put_object(ctx->s3bucket, path, (uint8_t *)olddata, realsize);    s3dirent_t *parent = NULL; //updating metadata
+    
     int parentSize = s3fs_get_object(ctx->s3bucket, (char *) dir, (uint8_t **) &parent, 0, 0);
     int numEntries = (int) parentSize / sizeof(s3dirent_t);    time_t now = time(NULL)-18000;
     parent[0].metadata.st_mtime = now;
@@ -566,7 +631,12 @@ int fs_write(const char *path, const char *buf, size_t size, off_t offset, struc
             parent[i].metadata.st_size = realsize;
         }
     }
-        s3fs_put_object(ctx->s3bucket, (char *) dir, (uint8_t*)parent, parentSize);    return size;
+        s3fs_put_object(ctx->s3bucket, (char *) dir, (uint8_t*)parent, parentSize);    
+        free(str1);
+        free(str2);
+        free(olddata);
+        free(parent);
+        return size;
 }
 
 /* 
@@ -626,14 +696,17 @@ int fs_opendir(const char *path, struct fuse_file_info *fi) {
 
     if (rv < 0) {
         printf("Failure in s3fs_get_object\n");
+        free(retrieved_object);
         return -ENOENT;
     } else if (rv < sizeof(s3dirent_t)) {
         printf("Failed to retrieve entire object (s3fs_get_object %d)\n", rv);
+        free(retrieved_object);
         return -EIO;
     } else {
         printf("Successfully retrieved test object from s3 (s3fs_get_object)\n");
         int numEntries = (int) rv / sizeof(s3dirent_t);
         fprintf(stderr, "There are currently %i entries.\n", numEntries);
+        free(retrieved_object);
         return 0;
     }
 }
@@ -654,9 +727,11 @@ int fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset
     s3dirent_t *dir = (s3dirent_t *) retrieved_object;
     if (rv < 0) {
         printf("Failure in s3fs_get_object\n");
+        free(retrieved_object);
         return -ENOENT;
     } else if (rv < sizeof(s3dirent_t)) {
         printf("Failed to retrieve entire object (s3fs_get_object %d)\n", rv);
+        free(retrieved_object);
         return -EIO;
     } else {
         printf("Successfully retrieved test object from s3 (s3fs_get_object)\n");
@@ -668,12 +743,14 @@ int fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset
             // call filler function to fill in directory name
             // to the supplied buffer
             if (filler(buf, dir[i].name, NULL, 0) != 0) {
+                free(retrieved_object);
                 return -ENOMEM;
             }
         }
+        free(retrieved_object);
         return 0;
     }
-
+    free(retrieved_object);
     return -EIO;
 }
 /*
@@ -722,13 +799,14 @@ void *fs_init(struct fuse_conn_info *conn)
     md.st_gid = getgid();
     root->metadata = md;
     //store directory object to S3
-    fprintf(stderr, "got to bucket\n");//
     if(sizeof(s3dirent_t) == s3fs_put_object(ctx->s3bucket, (char*)"/", (uint8_t*)root, sizeof(s3dirent_t))){
       fprintf(stderr, "fs_init --- file sysetem initalized.\n");
-      free(root);
     }else{
-      printf("\n"); return NULL;
+      printf("\n"); 
+      free(root);
+      return NULL;
     }
+    free(root);
     return ctx;
 }
 
@@ -762,12 +840,17 @@ int fs_ftruncate(const char *path, off_t offset, struct fuse_file_info *fi) {
     
     uint8_t *target = NULL;
     s3dirent_t *parent = NULL;
+
     char *str1 = strdup(path);
     char *str2 = strdup(path);
+
     char *childName = basename(str1);
     char *parentName = dirname(str2);
     ssize_t childSize = s3fs_get_object(ctx->s3bucket,path,(uint8_t**)&target,0,0);
     if(childSize < 0){
+        free(str1);
+        free(str2);
+        free(target);
         return -ENOENT;//file does not exist
     }
     //If it does, pull down the parent directory.
@@ -783,6 +866,10 @@ int fs_ftruncate(const char *path, off_t offset, struct fuse_file_info *fi) {
     }
     //Make sure it isn't a directory.
     if(parent[i].type == 'd'){
+        free(str1);
+        free(str2);
+        free(target);
+        free(parent);
         return -EISDIR;
     }
     time_t now = time(NULL) - 18000;
@@ -795,6 +882,10 @@ int fs_ftruncate(const char *path, off_t offset, struct fuse_file_info *fi) {
     //Replace old files with the modified directory and new (empty) file.
     s3fs_put_object(ctx->s3bucket,path,(uint8_t*)target,0);
     s3fs_put_object(ctx->s3bucket,parentName,(uint8_t*)parent,parentSize);
+    free(str1);
+    free(str2);
+    free(target);
+    free(parent);
     return 0;
 }
 /*
