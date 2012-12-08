@@ -155,7 +155,7 @@ int fs_mknod(const char *path, mode_t mode, dev_t dev) {
     parent[numEntries].type = 'f';
     struct stat md;
     md.st_blocks = (blkcnt_t) 0;
-    md.st_mode = (S_IFREG | S_IRUSR | S_IWUSR | S_IXUSR);
+    md.st_mode = mode;
     md.st_size = 0;
     time_t now = time(NULL) - 18000;
     md.st_mtime = now;
@@ -212,7 +212,7 @@ int fs_mkdir(const char *path, mode_t mode) {
     newEntry->type = 'd';
     struct stat md;
     md.st_blocks = (blkcnt_t) 0;
-    md.st_mode = (S_IFDIR | S_IRUSR | S_IWUSR | S_IXUSR);
+    md.st_mode = mode;
     md.st_size = (off_t) sizeof(s3dirent_t);
     time_t now = time(NULL) - 18000;
     md.st_mtime = now;
@@ -246,8 +246,47 @@ int fs_mkdir(const char *path, mode_t mode) {
  */
 int fs_unlink(const char *path) {
     fprintf(stderr, "fs_unlink(path=\"%s\")\n", path);
-    //s3context_t *ctx = GET_PRIVATE_DATA;
-    return -EIO;
+    s3context_t *ctx = GET_PRIVATE_DATA;
+    //Make sure the file exists.
+    s3dirent_t *target = NULL;
+    s3dirent_t *parent = NULL;
+    char *str1 = strdup(path);
+    char *str2 = strdup(path);
+    char *childName = basename(str1);
+    char *parentName = dirname(str2);
+    ssize_t childSize = s3fs_get_object(ctx->s3bucket,path,(uint8_t**)&target,0,0);
+    if(childSize < 0){
+        return -ENOENT;//file does not exist
+    }
+    //Make sure it isn't a directory.
+    if(target[0].type == 'd'){
+        return -EISDIR;
+    }
+    //If it does, pull down the parent directory.
+    ssize_t parentSize = s3fs_get_object(ctx->s3bucket,parentName,(uint8_t**)&parent,0,0);
+    int numEntries = (int) parentSize / sizeof(s3dirent_t);
+    //Remove its entry from the parent directory.
+    int index = -1;
+    int i = 0;
+    for(;i<numEntries;i++){
+        if(!strcasecmp(parent[i].name,childName)){
+            index = i;
+        }
+    }
+    if(index<0){
+        return -ENOENT;//File doesn't exist in the directory; problem.
+    }
+    //Update the parent's metadata.
+    s3dirent_t finalEntry = parent[numEntries-1];
+    parent = realloc(parent,(numEntries-1)*sizeof(s3dirent_t));
+    if(index<(numEntries-1)){
+        parent[index] = finalEntry;
+    }
+    //Push the parent back up.
+    s3fs_put_object(ctx->s3bucket,parentName,(uint8_t*)parent,((numEntries-1)*sizeof(s3dirent_t)));
+    //Erase the file from the bucket.
+    s3fs_remove_object(ctx->s3bucket,path);
+    return 0;
 }
 
 /*
@@ -326,7 +365,6 @@ int fs_rename(const char *path, const char *newpath) {
     if(parentSize < 0){
         return -ENOENT;//Part of the directory does not exist.
     }
-    fprintf(stderr, "1\n");
     //Modify the parent's metadata.
     time_t now = time(NULL)-18000;
     parent[0].metadata.st_mtime = now;
@@ -338,17 +376,17 @@ int fs_rename(const char *path, const char *newpath) {
             strcpy(parent[i].name, newname);
         }
     }
-    //pull down file, remove it from server, put it back under new name
     uint8_t  *entry = NULL;
     ssize_t fileSize = s3fs_get_object(ctx->s3bucket,path,(uint8_t**)&entry,0,0);
     if(fileSize < 0){
         return -ENOENT;//Part of the directory does not exist.
     }
+
+    s3fs_put_object(ctx->s3bucket,newpath,(uint8_t*)entry,fileSize);
     s3fs_remove_object(ctx->s3bucket,path);
     s3fs_remove_object(ctx->s3bucket,parentName);
-    s3fs_put_object(ctx->s3bucket,newpath,(uint8_t*)entry,fileSize);
     s3fs_put_object(ctx->s3bucket, parentName, (uint8_t*)parent, ((numEntries)*sizeof(s3dirent_t)));
-
+    
     return 0;
 }
 /*
@@ -378,15 +416,44 @@ int fs_chown(const char *path, uid_t uid, gid_t gid) {
  */
 int fs_truncate(const char *path, off_t newsize) {
     fprintf(stderr, "fs_truncate(path=\"%s\", newsize=%d)\n", path, (int)newsize);
-    //s3context_t *ctx = GET_PRIVATE_DATA;
-		//Check to see if the file exists. 
-		//If it does, pull down the parent directory.
-		//Modify the metadata to reflect the new file attributes.
-		//Erase the old directory and file from the bucket.
-		//Replace them with the modified directory and new (empty) file.
-		//Copy this to ftruncate.
-		//Also needs to check permissions and a bunch of other stuff like that, but details!
-    return -EIO;
+    s3context_t *ctx = GET_PRIVATE_DATA;
+    
+    uint8_t *target = NULL;
+    s3dirent_t *parent = NULL;
+    char *str1 = strdup(path);
+    char *str2 = strdup(path);
+    char *childName = basename(str1);
+    char *parentName = dirname(str2);
+    ssize_t childSize = s3fs_get_object(ctx->s3bucket,path,(uint8_t**)&target,0,0);
+    if(childSize < 0){
+        return -ENOENT;//file does not exist
+    }
+    //If it does, pull down the parent directory.
+    ssize_t parentSize = s3fs_get_object(ctx->s3bucket,parentName,(uint8_t**)&parent,0,0);
+    int numEntries = (int) parentSize / sizeof(s3dirent_t);
+    //Modify the metadata to reflect the new file attributes.
+    int index = 0;
+    int i = 0;
+    for (;i<numEntries;i++){
+        if(!strcasecmp(parent[i].name,childName)){
+            index = i;
+        }
+    }
+    //Make sure it isn't a directory.
+    if(parent[i].type == 'd'){
+        return -EISDIR;
+    }
+    time_t now = time(NULL) - 18000;
+    parent[i].metadata.st_size = 0;
+    parent[i].metadata.st_mtime = now;
+    parent[i].metadata.st_atime = now;
+    parent[0].metadata.st_size -= childSize;
+    parent[0].metadata.st_mtime = now;
+    parent[0].metadata.st_atime = now;
+    //Replace old files with the modified directory and new (empty) file.
+    s3fs_put_object(ctx->s3bucket,path,(uint8_t*)target,0);
+    s3fs_put_object(ctx->s3bucket,parentName,(uint8_t*)parent,parentSize);
+    return 0;
 }
 /*
  * Change the access and/or modification times of a file. 
@@ -472,8 +539,34 @@ int fs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_
 int fs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_write(path=\"%s\", buf=%p, size=%d, offset=%d)\n",
           path, buf, (int)size, (int)offset);
-    //s3context_t *ctx = GET_PRIVATE_DATA;
-    return -EIO;
+    s3context_t *ctx = GET_PRIVATE_DATA;
+
+    char *str1 = strdup(path);
+    char *str2 = strdup(path);
+    char *base = basename(str1);
+    char *dir = dirname(str2);
+
+    int *olddata = NULL;
+    int rv = s3fs_get_object(ctx->s3bucket, path, (uint8_t **) &olddata, 0, offset);
+    if(rv == -1){
+        return -EIO; //no file
+    }    int realsize = (rv - offset) + rv + size;
+    olddata = realloc(olddata,realsize);
+    memcpy((void *)&olddata[offset],(void *)buf,size);
+    s3fs_remove_object(ctx->s3bucket, path);
+    s3fs_put_object(ctx->s3bucket, path, (uint8_t *)olddata, realsize);    s3dirent_t *parent = NULL; //updating metadata
+    int parentSize = s3fs_get_object(ctx->s3bucket, (char *) dir, (uint8_t **) &parent, 0, 0);
+    int numEntries = (int) parentSize / sizeof(s3dirent_t);    time_t now = time(NULL)-18000;
+    parent[0].metadata.st_mtime = now;
+    parent[0].metadata.st_atime = now;
+
+    int i = 0;
+    for (;i<numEntries;i++){
+        if(!strcasecmp(base,parent[i].name)){
+            parent[i].metadata.st_size = realsize;
+        }
+    }
+        s3fs_put_object(ctx->s3bucket, (char *) dir, (uint8_t*)parent, parentSize);    return size;
 }
 
 /* 
@@ -665,8 +758,44 @@ int fs_access(const char *path, int mask) {
  */
 int fs_ftruncate(const char *path, off_t offset, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_ftruncate(path=\"%s\", offset=%d)\n", path, (int)offset);
-    //s3context_t *ctx = GET_PRIVATE_DATA;
-    return -EIO;
+    s3context_t *ctx = GET_PRIVATE_DATA;
+    
+    uint8_t *target = NULL;
+    s3dirent_t *parent = NULL;
+    char *str1 = strdup(path);
+    char *str2 = strdup(path);
+    char *childName = basename(str1);
+    char *parentName = dirname(str2);
+    ssize_t childSize = s3fs_get_object(ctx->s3bucket,path,(uint8_t**)&target,0,0);
+    if(childSize < 0){
+        return -ENOENT;//file does not exist
+    }
+    //If it does, pull down the parent directory.
+    ssize_t parentSize = s3fs_get_object(ctx->s3bucket,parentName,(uint8_t**)&parent,0,0);
+    int numEntries = (int) parentSize / sizeof(s3dirent_t);
+    //Modify the metadata to reflect the new file attributes.
+    int index = 0;
+    int i = 0;
+    for (;i<numEntries;i++){
+        if(!strcasecmp(parent[i].name,childName)){
+            index = i;
+        }
+    }
+    //Make sure it isn't a directory.
+    if(parent[i].type == 'd'){
+        return -EISDIR;
+    }
+    time_t now = time(NULL) - 18000;
+    parent[i].metadata.st_size = 0;
+    parent[i].metadata.st_mtime = now;
+    parent[i].metadata.st_atime = now;
+    parent[0].metadata.st_size -= childSize;
+    parent[0].metadata.st_mtime = now;
+    parent[0].metadata.st_atime = now;
+    //Replace old files with the modified directory and new (empty) file.
+    s3fs_put_object(ctx->s3bucket,path,(uint8_t*)target,0);
+    s3fs_put_object(ctx->s3bucket,parentName,(uint8_t*)parent,parentSize);
+    return 0;
 }
 /*
  * The struct that contains pointers to all our callback
